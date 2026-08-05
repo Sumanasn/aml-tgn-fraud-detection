@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+data/raw/
+data/processed/
+amlsim_ref/
+checkpoints/
+*.pt
+*.ckpt
+.env
+kaggle.json

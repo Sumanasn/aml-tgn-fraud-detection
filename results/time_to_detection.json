@@ -1,0 +1,8 @@
+{
+  "n_fraud_nodes": 463,
+  "gnn_median_lag_steps": 4.0,
+  "baseline_median_lag_steps": 3.0,
+  "gnn_detected_pct": 1.0,
+  "baseline_detected_pct": 1.0,
+  "gnn_faster_than_baseline_pct": 0.2159827213822894
+}
