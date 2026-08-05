@@ -116,6 +116,7 @@ def main(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     data, static_x, y, fraud_step, num_nodes = build_temporal_data(dataset)
+    data = data.to(device)  # keeps data.t[e_id]/data.msg[e_id] on the same device as e_id (from neighbor_loader)
     static_x, y = static_x.to(device), y.to(device)
 
     model = TGNFraudDetector(

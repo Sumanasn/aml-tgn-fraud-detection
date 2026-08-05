@@ -104,6 +104,7 @@ def snapshot_first_detected(dataset, step_interval, fraud_ids, gnn_model, mean, 
 @torch.no_grad()
 def tgn_causal_first_detected(dataset, step_interval, fraud_ids, tgn_model, neighbor_size, device, batch_size=200):
     data, static_x, y, fraud_step, num_nodes = build_temporal_data(dataset)
+    data = data.to(device)  # keeps data.t[e_id]/data.msg[e_id] on the same device as e_id (from neighbor_loader)
     static_x = static_x.to(device)
 
     neighbor_loader = LastNeighborLoader(num_nodes, size=neighbor_size, device=device)
@@ -169,34 +170,60 @@ def main(dataset: str = "20K_cycle200", step_interval: int = 10):
     else:
         print("No TGN checkpoint found -- skipping TGN in comparison (train it with src/training/train_tgn.py).")
 
+    # NOTE: a node never flagged within the observation window has no real
+    # "detection step" -- don't default it to max_step + step_interval and
+    # plot that. lag = (max_step + step_interval) - fraud_step is then a pure
+    # function of fraud_step (slope -1), which shows up as a perfectly
+    # straight diagonal line of fake "very late detections" that's actually
+    # just "never detected, for every fraud_step value at once". Track
+    # detected/missed separately instead and only plot real detections.
     rows = []
     for node_id, fraud_step in fraud_nodes.items():
         if fraud_step < 0:
             continue
-        g_step = first_detected_gnn.get(node_id, max_step + step_interval)
-        b_step = first_detected_baseline.get(node_id, max_step + step_interval)
-        row = {"node_id": node_id, "fraud_step": fraud_step, "gnn_lag": g_step - fraud_step, "baseline_lag": b_step - fraud_step}
-        if first_detected_tgn:
-            t_step = first_detected_tgn.get(node_id, max_step + step_interval)
-            row["tgn_lag"] = t_step - fraud_step
+        row = {"node_id": node_id, "fraud_step": fraud_step}
+        for key, first_detected in (("gnn", first_detected_gnn), ("baseline", first_detected_baseline), ("tgn", first_detected_tgn)):
+            if not first_detected and key == "tgn":
+                continue
+            step = first_detected.get(node_id)
+            row[f"{key}_detected"] = step is not None
+            row[f"{key}_lag"] = (step - fraud_step) if step is not None else None
         rows.append(row)
 
     rows.sort(key=lambda r: r["fraud_step"])
-    fraud_step_arr = np.array([r["fraud_step"] for r in rows])
-    gnn_lag = np.array([r["gnn_lag"] for r in rows])
-    baseline_lag = np.array([r["baseline_lag"] for r in rows])
+
+    def model_summary(rows, key):
+        detected_rows = [r for r in rows if r[f"{key}_detected"]]
+        lags = np.array([r[f"{key}_lag"] for r in detected_rows])
+        return {
+            "detected_pct": len(detected_rows) / len(rows),
+            "median_lag_steps": float(np.median(lags)) if len(lags) else None,
+        }, detected_rows
+
+    gnn_stats, gnn_detected_rows = model_summary(rows, "gnn")
+    baseline_stats, baseline_detected_rows = model_summary(rows, "baseline")
 
     summary = {
         "n_fraud_nodes": len(rows),
-        "gnn_median_lag_steps": float(np.median(gnn_lag)),
-        "baseline_median_lag_steps": float(np.median(baseline_lag)),
-        "gnn_faster_than_baseline_pct": float((gnn_lag < baseline_lag).mean()),
+        "gnn": gnn_stats,
+        "baseline": baseline_stats,
     }
     if first_detected_tgn:
-        tgn_lag = np.array([r["tgn_lag"] for r in rows])
-        summary["tgn_median_lag_steps"] = float(np.median(tgn_lag))
-        summary["tgn_faster_than_baseline_pct"] = float((tgn_lag < baseline_lag).mean())
-        summary["tgn_faster_than_gnn_pct"] = float((tgn_lag < gnn_lag).mean())
+        tgn_stats, tgn_detected_rows = model_summary(rows, "tgn")
+        summary["tgn"] = tgn_stats
+
+    # faster-than comparisons only make sense on nodes both models actually detected
+    both = [r for r in rows if r["gnn_detected"] and r["baseline_detected"]]
+    if both:
+        summary["gnn_faster_than_baseline_pct_of_both_detected"] = float(
+            np.mean([r["gnn_lag"] < r["baseline_lag"] for r in both])
+        )
+    if first_detected_tgn:
+        both_tgn = [r for r in rows if r["tgn_detected"] and r["baseline_detected"]]
+        if both_tgn:
+            summary["tgn_faster_than_baseline_pct_of_both_detected"] = float(
+                np.mean([r["tgn_lag"] < r["baseline_lag"] for r in both_tgn])
+            )
 
     print(json.dumps(summary, indent=2))
 
@@ -205,14 +232,23 @@ def main(dataset: str = "20K_cycle200", step_interval: int = 10):
         json.dump(summary, f, indent=2)
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.scatter(fraud_step_arr, gnn_lag, s=14, alpha=0.6, label="GraphSAGE GNN (snapshot)", color="#2563eb")
-    ax.scatter(fraud_step_arr, baseline_lag, s=14, alpha=0.6, label="XGBoost baseline", color="#dc2626")
+    ax.scatter(
+        [r["fraud_step"] for r in gnn_detected_rows], [r["gnn_lag"] for r in gnn_detected_rows],
+        s=14, alpha=0.6, label=f"GraphSAGE GNN (snapshot, {gnn_stats['detected_pct']:.0%} detected)", color="#2563eb",
+    )
+    ax.scatter(
+        [r["fraud_step"] for r in baseline_detected_rows], [r["baseline_lag"] for r in baseline_detected_rows],
+        s=14, alpha=0.6, label=f"XGBoost baseline ({baseline_stats['detected_pct']:.0%} detected)", color="#dc2626",
+    )
     if first_detected_tgn:
-        ax.scatter(fraud_step_arr, tgn_lag, s=14, alpha=0.6, label="TGN (causal online)", color="#16a34a")
+        ax.scatter(
+            [r["fraud_step"] for r in tgn_detected_rows], [r["tgn_lag"] for r in tgn_detected_rows],
+            s=14, alpha=0.6, label=f"TGN (causal online, {tgn_stats['detected_pct']:.0%} detected)", color="#16a34a",
+        )
     ax.axhline(0, color="gray", linestyle="--", linewidth=1, label="fraudStep (ground truth)")
     ax.set_xlabel("Ground-truth fraudStep (when node entered the laundering pattern)")
     ax.set_ylabel("Detection lag (steps after fraudStep; negative = detected early)")
-    ax.set_title("Time-to-detection: GNN vs. TGN vs. tabular baseline")
+    ax.set_title("Time-to-detection: GNN vs. TGN vs. tabular baseline\n(undetected fraud nodes excluded -- see legend for detected %)")
     ax.legend()
     fig.tight_layout()
     fig.savefig(RESULTS_DIR / "time_to_detection.png", dpi=150)
