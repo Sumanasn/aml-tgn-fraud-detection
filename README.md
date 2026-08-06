@@ -117,6 +117,20 @@ never for automated action.
 This is where the results actually point, and it's a standard pattern in
 real fraud systems for exactly this reason:
 
+```mermaid
+flowchart LR
+    TX["Live transaction"] --> T1["Tier 1 — Gatekeeper<br/>XGBoost + closed-loop feature<br/>real-time, 2% flag rate"]
+    T1 -->|"below threshold (98%)"| PASS["Clears normally"]
+    T1 -->|"flagged (2%)<br/>95% precision, 0-step lag"| HOLD["Hold / step-up auth<br/>before funds leave"]
+    HOLD --> T2["Tier 2 — Deep scan<br/>GraphSAGE GNN + closed-loop feature<br/>async, 10-20% flag rate"]
+    T2 --> RING["Maps full ring:<br/>other shell accounts,<br/>connected transfers"]
+    RING --> FREEZE["Freeze / investigate<br/>entire connected ring"]
+```
+
+Tier 1 blocks the live transaction in real time; Tier 2 runs off the
+critical path and only has to be thorough, not fast — it picks up exactly
+where Tier 1 left off.
+
 **Tier 1 — instant gatekeeper: XGBoost + closed-loop feature, at a 2% flag
 rate.** Sits directly on the live transaction stream. 95% precision means
 very few legitimate transactions get caught up in it; 0-step delay means it
@@ -207,23 +221,43 @@ notebooks/
   kaggle_train.ipynb         # clones this repo, runs the full pipeline on free Kaggle GPU
 ```
 
-## Running it
+## Reproducibility
 
-**Local (CPU, for dev/smoke-testing):**
+**Tested with:** Python 3.12, `torch` 2.13 (CPU build; any CUDA build works
+identically on GPU), `torch-geometric` 2.8, `xgboost` 3.4, `scikit-learn`
+1.9, `pandas` 3.0, `numpy` 2.5, `networkx` 3.6, `matplotlib` 3.11 — see
+`requirements.txt` for the full pinned-minimum list.
+
 ```bash
 python -m venv venv && source venv/Scripts/activate   # or venv/bin/activate on Linux/Mac
 pip install -r requirements.txt
 
 python -m src.data_pipeline.download_amlsim --dataset 20K_cycle200
-python -m src.training.train_baseline
-python -m src.training.train_gnn
-python -m src.training.train_tgn                      # slow on CPU -- see the Kaggle notebook for GPU
-python -m src.training.cycle_feature_diagnostic
-python -m src.training.gnn_cycle_feature_diagnostic
-python -m src.training.threshold_sweep
-python -m src.training.time_to_detection
-python -m src.explain.explain
 ```
+
+Each step below writes its numbers to `results/*.json` — run them in this
+order, since several steps load a checkpoint saved by an earlier one:
+
+| Step | Command | Produces | Depends on |
+|---|---|---|---|
+| 1 | `python -m src.training.train_baseline` | `results/baseline_xgboost.json`, `checkpoints/xgboost.json` | — |
+| 2 | `python -m src.training.train_gnn` | `results/gnn.json`, `checkpoints/gnn.pt` | — |
+| 3 | `python -m src.training.train_tgn` | `results/tgn.json`, `checkpoints/tgn.pt` | — (slow on CPU; use the Kaggle notebook for GPU) |
+| 4 | `python -m src.training.cycle_feature_diagnostic` | `results/baseline_cycle_features.json`, `checkpoints/xgboost_cycle.json` | — |
+| 5 | `python -m src.training.gnn_cycle_feature_diagnostic` | `results/gnn_cycle_features.json`, `checkpoints/gnn_cycle.pt` | — |
+| 6 | `python -m src.training.threshold_sweep` | **`results/threshold_sweep.json`** — the precision/speed table above | steps 4 and 5 (loads their checkpoints, doesn't retrain) |
+| 7 | `python -m src.training.time_to_detection` | `results/time_to_detection.json`, `results/time_to_detection.png` | steps 1-3 |
+| 8 | `python -m src.explain.explain` | `results/explain_node_*.png`, `results/explanations.json` | step 2 |
+
+To reproduce the exact threshold table in this README, run steps 1-6 in
+order and read `results/threshold_sweep.json`.
+
+**Note on exact reproducibility:** `train_val_test_split` uses a fixed seed
+(42), so every model trains/evaluates on the identical account split. Model
+weight initialization and dropout are *not* seeded, so re-running training
+will land close to these numbers but not bit-for-bit identical — set
+`torch.manual_seed(...)` at the top of a training script if you need exact
+determinism.
 
 **Full GPU training (free):** open `notebooks/kaggle_train.ipynb` on
 [Kaggle](https://kaggle.com) (Settings → Accelerator: **GPU T4 x2**,
