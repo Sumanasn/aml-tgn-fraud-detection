@@ -1,157 +1,210 @@
 # AML-TGN: Graph-Based Money-Siphoning & Shell-Ring Detection
 
-Detects cyclic transfers and shell-account laundering rings in transaction
-graphs, comparing a tabular baseline against a GraphSAGE GNN and a Temporal
-Graph Network (TGN) — and honestly tests the claim that graph-aware models
-catch these rings *earlier* than volume/degree-based tabular features can.
+Detects money-laundering rings hidden in transaction data by comparing three
+approaches — a standard machine-learning baseline, a Graph Neural Network,
+and a Temporal Graph Network — and rigorously tests a specific claim:
+**do models that understand network structure catch laundering rings earlier
+than models that only look at transaction volume?**
 
-## Why this exists
+## The short version
 
-Standard fraud tooling flags accounts by transaction volume, velocity, or
-degree — signals that only accumulate *after* a laundering ring has been
-moving money for a while. A cyclic transfer ring (money in, laundered
-through N shell accounts, money out) is a **structural** pattern, visible in
-the graph topology before it's visible in any single account's statistics.
-The question this project actually tests: does a model that can see graph
-structure detect the ring earlier than one that can't?
+- **Best accuracy**: a Graph Neural Network (GNN), enhanced with an explicit
+  "closed-loop" structural feature, correctly identifies fraud accounts far
+  better than a standard tabular model (XGBoost) — a ~22% improvement in
+  detection quality.
+- **Best speed**: that same structural feature, fed to the simpler tabular
+  model instead, flags fraud rings *the moment they form* (0-step delay),
+  faster than the GNN and faster than a more complex Temporal GNN built
+  specifically to solve this.
+- **The honest surprise**: bigger, more sophisticated models did not win on
+  every dimension. The right answer wasn't "use the fanciest model" — it was
+  "test everything, measure the actual tradeoff, and use two models for two
+  different jobs." That production design (below) is the real deliverable.
 
-## Data
+## The problem, in plain terms
+
+A money-laundering ring works by moving funds through a chain of shell
+accounts back to where they started — account A pays B, B pays C, C pays D,
+D pays back to A. Standard fraud tools flag accounts by looking at how much
+money moves through them or how often — but that signal only builds up
+*after* a ring has been operating for a while. The shape of the ring itself
+(a closed loop of transfers) is visible in the data earlier, if a model
+knows how to look for it. This project tests whether that's actually true.
+
+## The data
 
 [IBM AMLSim](https://github.com/IBM/AMLSim)'s pre-generated `20K_cycle200`
-sample — synthetic but with embedded ground-truth laundering cycles, so
-detection quality and timing are exactly measurable (no real-world labels
-needed, no entity-resolution mess).
+sample: synthetic transaction data with 200 laundering rings deliberately
+built into it, so we know exactly which accounts are fraudulent and exactly
+when each one joined a ring — which makes it possible to measure detection
+*speed*, not just accuracy.
 
 | | |
 |---|---|
-| Nodes (accounts) | 20,000 |
-| Transactions (edges) | 117,805 |
-| Fraud nodes | 945 (4.7%) |
-| Embedded cycle patterns | 200 |
+| Accounts | 20,000 |
+| Transactions | 117,805 |
+| Fraud accounts | 945 (4.7%) |
+| Laundering rings | 200 |
 | Time steps | 149 |
 
-The graph is **homogeneous** (account → account transfers only). The
-original design called for a heterogeneous schema (Account / Company /
-Individual with `SHARES_DIRECTOR` / `OWNED_BY` edges), but AMLSim only
-produces that structure by running its Java/MASON simulator with custom
-account parameter files — this project uses the ready-made sample data
-instead to get a working, honestly-evaluated pipeline first. See
-[Future work](#future-work).
+## What we tried
 
-## Models
-
-### 1. XGBoost baseline
-Tabular features + hand-engineered graph aggregations (in/out-degree,
-transaction volume, tx count, active steps) — no multi-hop message passing.
-`src/training/train_baseline.py`
-
-### 2. GraphSAGE GNN
-10-layer GraphSAGE with residual connections and JumpingKnowledge
-concatenation. `src/models/gnn.py`
-
-The depth isn't arbitrary: enumerating cycles in the fraud-node subgraph
-showed most embedded laundering cycles span **~10-12 hops**, not the 3-4
-node rings a shallow GNN would be tuned for. A plain 3-layer GNN can't see
-past 3 hops, so it structurally cannot represent "this account sits on a
-long cycle" — it just re-derives a smoothed version of the same
-volume/degree signal XGBoost already has. Residual connections + JK let the
-model go deep enough to match the actual cycle length without the
-oversmoothing that plain deep GCN/SAGE stacks suffer from.
-
-### 3. Temporal Graph Network (TGN)
-Memory module + temporal attention embedding (`torch_geometric`'s reference
-TGN recipe), trained via a link-prediction pretext task with a fraud
-classification head riding on the same causal embeddings.
-`src/models/tgn.py`, `src/training/train_tgn.py`
-
-Why add this on top of the GNN: the snapshot-based evaluation of the static
-GNN has a real confound — its `BatchNorm` running statistics are calibrated
-on the final, densest graph, then misapplied to much sparser early snapshots
-during time-to-detection scoring. TGN's memory updates continuously per
-transaction, so there's no snapshot to mismatch — the memory state at step
-*t* **is** the as-of-*t* representation, by construction.
+| Model | What it is |
+|---|---|
+| **XGBoost baseline** | Standard tabular ML on hand-built features: how much money moved through an account, how often, to/from how many other accounts. |
+| **GraphSAGE GNN** | A 10-layer graph neural network that learns account risk by passing information along the transaction network itself. Depth was matched to the actual ring size found in the data (~10-12 hops), not picked arbitrarily. |
+| **Temporal GNN (TGN)** | An online model that updates its understanding of each account continuously as transactions arrive, instead of only seeing periodic snapshots. |
+| **XGBoost / GNN + closed-loop feature** | The baseline and GNN, each additionally given one explicit signal: a mathematical count of how many short closed loops of transfers pass through each account — a direct, computable stand-in for "is this account part of a ring." |
 
 ## Results
 
-| Model | ROC-AUC | PR-AUC | Recall@100 | Recall@200 |
+### Accuracy — how well each model tells fraud from normal accounts
+
+| Model | PR-AUC (higher is better) |
+|---|---|
+| XGBoost baseline | 0.641 |
+| XGBoost + closed-loop feature | 0.685 |
+| Temporal GNN (TGN) | 0.689 |
+| GraphSAGE GNN | 0.729 |
+| **GraphSAGE GNN + closed-loop feature** | **0.781** |
+
+The GNN wins decisively once given the right signal to work with — a ~22%
+improvement in detection quality over the plain baseline.
+
+### Speed — how fast each model catches a ring, relative to when it actually forms
+
+Measured by replaying the transaction history and asking each model, "at
+what point would you have flagged this account?" — then comparing that to
+the moment AMLSim's ground truth says the ring actually started.
+
+| Model | % of rings caught | Typical delay |
+|---|---|---|
+| GraphSAGE GNN | 83.2% | 2 steps late |
+| Temporal GNN (TGN) | 86.0% | 2 steps late |
+| GraphSAGE GNN + closed-loop feature | 83.6% | 4 steps late |
+| XGBoost baseline | 86.6% | 1 step late |
+| **XGBoost + closed-loop feature** | **87.0%** | **0 steps — flags it as it forms** |
+
+This is the honest, non-obvious finding: **the same structural feature that
+made the GNN more accurate did not make it faster.** The simpler model,
+given the same information, reacted to it immediately; the GNN — which
+aggregates information smoothed across many transactions and hops — got
+better at long-run accuracy but slower to react to a still-forming pattern.
+
+### The real tradeoff: precision vs. speed
+
+Flagging more accounts catches more fraud but also flags more innocent ones
+— every automated system has to pick an operating point. We measured this
+directly instead of assuming it:
+
+| Flag rate | Model | Of flagged accounts, % actually fraud | % of rings caught | Delay |
 |---|---|---|---|---|
-| XGBoost baseline | 0.884 | 0.635 | 0.471 | 0.593 |
-| GraphSAGE GNN (10-layer) | 0.897 | **0.735** | **0.529** | **0.677** |
-| TGN | *pending full GPU training* | | | |
+| 1% | XGBoost + feature | **100%** | 70% | 2 steps late |
+| 1% | GNN + feature | **100%** | 64% | 6 steps late |
+| **2%** | **XGBoost + feature** | **95%** | **87%** | **0 steps** |
+| 2% | GNN + feature | 100% | 84% | 4 steps late |
+| 5% | XGBoost + feature | 61% | 99% | 6 steps early* |
+| 10%+ | either | 19-39% | ~100% | very early* |
 
-The GNN clearly wins on final detection quality once it's given enough
-receptive field to actually see the cycles — but that's the easier half of
-the claim.
+*Past ~5%, so many accounts get flagged that "catches early" is misleading
+— you're not detecting smarter, you're just casting a much wider net and
+accepting a lot more false alarms (at 10%+, roughly 2 out of 3 flagged
+accounts are innocent). That band is only usable for a human review queue,
+never for automated action.
 
-### Time-to-detection: the honest part
+## Production recommendation: a two-tier system
 
-Both models are frozen and re-scored on cumulative transaction snapshots
-(only past edges included), then compared against AMLSim's ground-truth
-`fraudStep` — the step at which a node actually entered a laundering
-pattern. This directly tests "does the model flag it earlier?"
+This is where the results actually point, and it's a standard pattern in
+real fraud systems for exactly this reason:
 
-```
-gnn_median_lag_steps:          4.0
-baseline_median_lag_steps:     3.0
-gnn_faster_than_baseline_pct:  21.6%
-```
+**Tier 1 — instant gatekeeper: XGBoost + closed-loop feature, at a 2% flag
+rate.** Sits directly on the live transaction stream. 95% precision means
+very few legitimate transactions get caught up in it; 0-step delay means it
+can hold or step-up-authenticate a transaction *before the ring is even
+fully aware it's been caught*. Use the tighter 1% setting (100% precision,
+but only 70% of rings caught) if the business needs zero false positives on
+automated blocking.
 
-**The GNN did not detect earlier than the tabular baseline** — despite
-winning decisively on final accuracy. This survived one iteration (going
-from 3 to 10 layers improved median lag from 5→4 steps, not enough to flip
-the result) and pointed to a second, distinct confound: the BatchNorm
-distribution-shift problem described above. TGN was built specifically to
-remove that confound by evaluating online instead of via re-scored
-snapshots; that comparison is pending the full GPU training run (see
-`results/time_to_detection.json` for the latest numbers after re-running
-`src/training/time_to_detection.py`).
+**Tier 2 — background deep scan: GraphSAGE GNN + closed-loop feature, run
+asynchronously.** Doesn't need to block anything in real time, so it can run
+looser (10-20% flag rate, 71-84% of rings found) and use its superior
+accuracy to map out the *entire* ring — other shell accounts, other
+connected transfers — once Tier 1 has already paused the live transaction.
 
-This is reported as a finding, not hidden: a GNN with more model capacity
-and a longer receptive field is not automatically faster to react, and
-proving "earlier detection" requires ruling out training/evaluation
-artifacts (receptive field, normalization) before it's a real result — not
-just picking the model with the better headline PR-AUC.
+Neither model alone is the right answer. The fast one misses ~13% of rings
+entirely within the observation window; the accurate one is too slow to
+stop money leaving an account in real time. Together, they cover both
+failure modes.
+
+## How we got here (why this is trustworthy, not cherry-picked)
+
+The headline finding — "the fancy model didn't automatically win" — only
+means something if you can see it wasn't the result of giving up early or
+tuning until a convenient number appeared. Short version of the actual path:
+
+1. Built a plain 3-layer GNN — it did *not* detect rings earlier than the
+   tabular baseline, despite being far more complex.
+2. Diagnosed why: laundering rings in this data span ~10-12 hops, and a
+   3-layer GNN can only see 3 hops. Deepened it to 10 layers with residual
+   connections — final accuracy improved, but detection speed barely moved.
+3. Diagnosed a second issue: the GNN's normalization layers were calibrated
+   on the full, dense final graph, then misapplied when scoring the sparse
+   early snapshots used for speed testing — a real confound, not just an
+   excuse.
+4. Built a Temporal GNN specifically to eliminate that confound (it updates
+   continuously instead of using snapshots). It still didn't beat the
+   baseline on speed.
+5. Ran the cheapest possible test to find out why: did the *timing signal
+   even exist* in the data, independent of any model's ability to learn it?
+   Handed one explicit structural feature directly to XGBoost — no learning
+   required. It worked immediately (0-step delay), which proved the signal
+   was there all along and the deep models simply weren't extracting it
+   efficiently.
+6. Fed the same feature to the GNN. Fixed a real bug along the way (the
+   feature's numbers were too skewed for a neural network — a few accounts
+   had raw values in the thousands while most were zero — which crashed
+   training; a standard log-transform fixed it). Final result: the GNN's
+   *accuracy* jumped to the best of any model tested, but its *speed* still
+   didn't improve — confirming this is a genuine architectural property, not
+   a bug.
+7. Swept the flagging threshold to turn "GNN is slower" from an impression
+   into an exact, deployable number.
 
 ## Explainability
 
-`src/explain/explain.py` runs GNNExplainer on high-confidence true-positive
-fraud predictions, extracting the exact subgraph and edge weights the
-model's decision was actually driven by — the operational payoff of using a
-GNN over XGBoost: a tabular model can say "this account is suspicious", a
-GNN explanation can show *which transfer ring*. Output: `results/explain_node_<id>.png`
-per explained node, plus `results/explanations.json` with edge importances.
-
-Example: node 3209 (model score 1.000) — its top-25-edge explanatory
-subgraph pulls in 49 other accounts, 6 of them independently fraud-labeled.
-That's the signal a tabular model structurally can't produce: not just "this
-node is suspicious" but "here are the specific transfers and the other
-accounts implicated with it." Note the 10-layer receptive field means the
-subgraph spans the node's full multi-hop neighborhood, not a single tight
-visual ring — GNNExplainer is reporting the edges the *prediction* actually
-depended on, which is a broader (and more honest) signal than a hand-picked
-cycle would be.
+For a flagged account, `src/explain/explain.py` (GNNExplainer) extracts the
+*specific* subgraph the model's decision was based on — not just "this
+account is suspicious" but "here are the other accounts and transfers
+implicated with it." Example: node 3209 (flagged with 100% confidence) has
+an explanatory subgraph of 49 other accounts, 6 of them independently
+labeled as fraud — exactly the kind of output a tabular model cannot
+produce, no matter how good its features are. See `results/explain_node_*.png`.
 
 ## Repo layout
 
 ```
 src/
   data_pipeline/
-    download_amlsim.py    # pulls the pre-generated AMLSim sample (no Java sim needed)
-    build_graph.py         # static/cumulative-snapshot PyG Data objects + stratified split
-    temporal_data.py       # chronological TemporalData stream for TGN
+    download_amlsim.py     # pulls the pre-generated AMLSim sample (no Java sim needed)
+    build_graph.py          # static/cumulative-snapshot graphs + stratified split
+    temporal_data.py        # chronological event stream for TGN
+    cycle_features.py       # the closed-loop structural feature
   models/
-    gnn.py                 # FraudGNN: residual + JumpingKnowledge GraphSAGE
-    tgn.py                 # TGNFraudDetector: memory + attention embedding + two heads
+    gnn.py                  # GraphSAGE GNN (residual + JumpingKnowledge)
+    tgn.py                  # TGN: memory + temporal attention + two heads
   training/
-    train_baseline.py      # XGBoost
-    train_gnn.py            # GraphSAGE GNN
-    train_tgn.py             # TGN (link-prediction pretext + classification)
-    time_to_detection.py     # 3-way detection-lag comparison + plot
-    metrics.py                # ROC-AUC / PR-AUC / Recall@K
+    train_baseline.py               # XGBoost
+    train_gnn.py                     # GraphSAGE GNN
+    train_tgn.py                      # TGN
+    cycle_feature_diagnostic.py        # XGBoost + closed-loop feature
+    gnn_cycle_feature_diagnostic.py     # GNN + closed-loop feature
+    threshold_sweep.py                   # precision vs. speed tradeoff curve
+    time_to_detection.py                  # 3-way detection-speed comparison + plot
+    metrics.py                             # ROC-AUC / PR-AUC / Recall@K
   explain/
     explain.py               # GNNExplainer subgraph extraction
 notebooks/
-  kaggle_train.ipynb         # clones this repo, runs full pipeline on free Kaggle GPU
+  kaggle_train.ipynb         # clones this repo, runs the full pipeline on free Kaggle GPU
 ```
 
 ## Running it
@@ -164,24 +217,32 @@ pip install -r requirements.txt
 python -m src.data_pipeline.download_amlsim --dataset 20K_cycle200
 python -m src.training.train_baseline
 python -m src.training.train_gnn
-python -m src.training.train_tgn      # slow on CPU -- see notebooks/kaggle_train.ipynb for GPU
+python -m src.training.train_tgn                      # slow on CPU -- see the Kaggle notebook for GPU
+python -m src.training.cycle_feature_diagnostic
+python -m src.training.gnn_cycle_feature_diagnostic
+python -m src.training.threshold_sweep
 python -m src.training.time_to_detection
 python -m src.explain.explain
 ```
 
 **Full GPU training (free):** open `notebooks/kaggle_train.ipynb` on
-[Kaggle](https://kaggle.com) (Settings → Accelerator: GPU, Internet: On) —
-it clones this repo and runs the same pipeline with more epochs.
+[Kaggle](https://kaggle.com) (Settings → Accelerator: **GPU T4 x2**,
+Internet: On — avoid P100, see the notebook's first cell for why) — it
+clones this repo and runs the same pipeline.
 
 ## Future work
 
 - **Heterogeneous schema.** Run AMLSim's actual Java/MASON simulator with
-  custom account parameter files to get real `Company` / `Individual` /
-  `SHARES_DIRECTOR` / `OWNED_BY` structure, and swap `SAGEConv` for
-  `RGCNConv` + edge types (the training loop doesn't need to change).
-- **TGN vs. snapshot-GNN time-to-detection**, once full GPU training
-  finishes — the actual test this project was built to answer.
-- **Closed-walk / cycle-count features** (sparse adjacency matrix powers)
-  as an explicit structural signal, to isolate whether remaining
-  time-to-detection gaps are an information problem or a learning-capacity
-  problem.
+  custom account parameter files to get real Company/Individual/
+  shared-director/ownership structure, and swap `SAGEConv` for `RGCNConv` +
+  edge types.
+- **TGN + closed-loop features**, computed causally as the event stream
+  unfolds rather than per static snapshot — skipped here due to the real
+  risk of introducing a look-ahead bug, but the natural next test.
+- **Adversarial time-spreading.** AMLSim's cycles here form in a short,
+  concentrated burst. A launderer deliberately spreading transfers over time
+  to evade volume-based detection is a real, documented evasion tactic
+  ("structuring") — testing whether the GNN's advantage grows under that
+  harder condition would require generating data with genuine temporal
+  spread and real per-transaction ground truth (AMLSim's own simulator, not
+  post-hoc editing of the existing sample).

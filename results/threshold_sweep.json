@@ -1,0 +1,90 @@
+{
+  "xgboost_cycle": {
+    "0.01": {
+      "n_flagged": 40,
+      "precision": 1.0,
+      "recall": 0.21164021164021163,
+      "detected_pct": 0.6976241900647948,
+      "median_lag_steps": 2.0
+    },
+    "0.02": {
+      "n_flagged": 80,
+      "precision": 0.95,
+      "recall": 0.4021164021164021,
+      "detected_pct": 0.8704103671706264,
+      "median_lag_steps": 0.0
+    },
+    "0.05": {
+      "n_flagged": 200,
+      "precision": 0.605,
+      "recall": 0.6402116402116402,
+      "detected_pct": 0.9892008639308856,
+      "median_lag_steps": -6.0
+    },
+    "0.1": {
+      "n_flagged": 400,
+      "precision": 0.3375,
+      "recall": 0.7142857142857143,
+      "detected_pct": 0.9935205183585313,
+      "median_lag_steps": -23.0
+    },
+    "0.15": {
+      "n_flagged": 600,
+      "precision": 0.23833333333333334,
+      "recall": 0.7566137566137566,
+      "detected_pct": 1.0,
+      "median_lag_steps": -35.0
+    },
+    "0.2": {
+      "n_flagged": 800,
+      "precision": 0.18625,
+      "recall": 0.7883597883597884,
+      "detected_pct": 1.0,
+      "median_lag_steps": -43.0
+    }
+  },
+  "gnn_cycle": {
+    "0.01": {
+      "n_flagged": 44,
+      "precision": 1.0,
+      "recall": 0.2328042328042328,
+      "detected_pct": 0.6371490280777538,
+      "median_lag_steps": 6.0
+    },
+    "0.02": {
+      "n_flagged": 80,
+      "precision": 1.0,
+      "recall": 0.42328042328042326,
+      "detected_pct": 0.8358531317494601,
+      "median_lag_steps": 4.0
+    },
+    "0.05": {
+      "n_flagged": 200,
+      "precision": 0.685,
+      "recall": 0.7248677248677249,
+      "detected_pct": 0.9913606911447084,
+      "median_lag_steps": 1.0
+    },
+    "0.1": {
+      "n_flagged": 400,
+      "precision": 0.385,
+      "recall": 0.8148148148148148,
+      "detected_pct": 1.0,
+      "median_lag_steps": -18.0
+    },
+    "0.15": {
+      "n_flagged": 600,
+      "precision": 0.26166666666666666,
+      "recall": 0.8306878306878307,
+      "detected_pct": 1.0,
+      "median_lag_steps": -30.0
+    },
+    "0.2": {
+      "n_flagged": 800,
+      "precision": 0.19875,
+      "recall": 0.8412698412698413,
+      "detected_pct": 1.0,
+      "median_lag_steps": -41.0
+    }
+  }
+}

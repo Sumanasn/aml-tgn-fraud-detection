@@ -1,8 +1,17 @@
 {
   "n_fraud_nodes": 463,
-  "gnn_median_lag_steps": 4.0,
-  "baseline_median_lag_steps": 3.0,
-  "gnn_detected_pct": 1.0,
-  "baseline_detected_pct": 1.0,
-  "gnn_faster_than_baseline_pct": 0.2159827213822894
+  "gnn": {
+    "detected_pct": 0.8315334773218143,
+    "median_lag_steps": 2.0
+  },
+  "baseline": {
+    "detected_pct": 0.8660907127429806,
+    "median_lag_steps": 1.0
+  },
+  "tgn": {
+    "detected_pct": 0.8596112311015118,
+    "median_lag_steps": 2.0
+  },
+  "gnn_faster_than_baseline_pct_of_both_detected": 0.22043010752688172,
+  "tgn_faster_than_baseline_pct_of_both_detected": 0.28421052631578947
 }

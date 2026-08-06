@@ -72,7 +72,7 @@ def _node_features(nodes: pd.DataFrame, tx: pd.DataFrame) -> pd.DataFrame:
     return n[feature_cols]
 
 
-def _to_data(nodes: pd.DataFrame, tx: pd.DataFrame) -> Data:
+def _to_data(nodes: pd.DataFrame, tx: pd.DataFrame, include_cycle_features: bool = False) -> Data:
     feats = _node_features(nodes, tx)
     x = torch.tensor(feats.values, dtype=torch.float)
     y = torch.tensor(nodes.set_index("nodeid")["isFraud"].values, dtype=torch.long)
@@ -82,23 +82,32 @@ def _to_data(nodes: pd.DataFrame, tx: pd.DataFrame) -> Data:
     )
     edge_attr = torch.tensor(tx[["value", "time"]].values, dtype=torch.float)
 
+    if include_cycle_features:
+        # Computed from this call's edge_index only -- when called per cumulative
+        # snapshot (build_cumulative_snapshots), that's already restricted to
+        # time <= cutoff, so this stays causal (no future-edge leakage).
+        from src.data_pipeline.cycle_features import closed_walk_features
+
+        cw = closed_walk_features(edge_index, num_nodes=len(nodes))
+        x = torch.cat([x, torch.tensor(cw, dtype=torch.float)], dim=1)
+
     return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
 
 
-def build_full_graph(dataset: str = "20K_cycle200") -> Data:
+def build_full_graph(dataset: str = "20K_cycle200", include_cycle_features: bool = False) -> Data:
     nodes, tx = load_raw(dataset)
-    return _to_data(nodes, tx)
+    return _to_data(nodes, tx, include_cycle_features=include_cycle_features)
 
 
 def build_cumulative_snapshots(
-    dataset: str = "20K_cycle200", step_interval: int = 10
+    dataset: str = "20K_cycle200", step_interval: int = 10, include_cycle_features: bool = False
 ) -> list[tuple[int, Data]]:
     nodes, tx = load_raw(dataset)
     max_step = int(tx["time"].max())
     snapshots = []
     for cutoff in range(step_interval, max_step + step_interval, step_interval):
         tx_upto = tx[tx["time"] <= cutoff]
-        snapshots.append((cutoff, _to_data(nodes, tx_upto)))
+        snapshots.append((cutoff, _to_data(nodes, tx_upto, include_cycle_features=include_cycle_features)))
     return snapshots
 
 
