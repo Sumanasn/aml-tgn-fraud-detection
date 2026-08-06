@@ -8,18 +8,27 @@ than models that only look at transaction volume?**
 
 ## The short version
 
-- **Best accuracy**: a Graph Neural Network (GNN), enhanced with an explicit
-  "closed-loop" structural feature, correctly identifies fraud accounts far
-  better than a standard tabular model (XGBoost) — a ~22% improvement in
-  detection quality.
-- **Best speed**: that same structural feature, fed to the simpler tabular
-  model instead, flags fraud rings *the moment they form* (0-step delay),
-  faster than the GNN and faster than a more complex Temporal GNN built
-  specifically to solve this.
-- **The honest surprise**: bigger, more sophisticated models did not win on
-  every dimension. The right answer wasn't "use the fanciest model" — it was
-  "test everything, measure the actual tradeoff, and use two models for two
-  different jobs." That production design (below) is the real deliverable.
+**Operational blueprint** — what this project actually recommends deploying:
+
+| | **Tier 1: Real-time gatekeeper** | **Tier 2: Async investigator** |
+|---|---|---|
+| Model | XGBoost + closed-loop feature | GraphSAGE GNN + closed-loop feature |
+| Operating point | 2% flag rate | 10-20% flag rate |
+| Detection lag | **0.0 steps** (flags as the ring forms) | 4-6 steps (doesn't need to be instant) |
+| Precision | 95% (few false alarms) | not the priority — a human reviews |
+| Recall | 87% of rings caught | 71-84% of rings mapped |
+| Job | Block/hold the live transaction automatically | Map the *entire* ring for investigators, off the critical path |
+
+No single model does both jobs well — see [Results](#results) for why, and
+[Production recommendation](#production-recommendation-a-two-tier-system)
+for the full reasoning.
+
+**The honest surprise behind this design:** bigger, more sophisticated
+models did not win on every dimension. The GNN is the more accurate model
+(~22% better detection quality than plain XGBoost) but the *slower* one; the
+simpler model, given the same structural signal, reacts to it instantly. The
+right answer wasn't "use the fanciest model" — it was "test everything,
+measure the actual tradeoff, and use two models for two different jobs."
 
 ## The problem, in plain terms
 
@@ -95,22 +104,31 @@ better at long-run accuracy but slower to react to a still-forming pattern.
 
 Flagging more accounts catches more fraud but also flags more innocent ones
 — every automated system has to pick an operating point. We measured this
-directly instead of assuming it:
+directly instead of assuming it, and translated precision into what it
+actually costs: a false positive at Tier 1 means a real customer's
+transaction gets held or step-up-authenticated for no reason — that's the
+number that decides whether a threshold is deployable for *automated*
+action, or only safe for a human review queue.
 
-| Flag rate | Model | Of flagged accounts, % actually fraud | % of rings caught | Delay |
-|---|---|---|---|---|
-| 1% | XGBoost + feature | **100%** | 70% | 2 steps late |
-| 1% | GNN + feature | **100%** | 64% | 6 steps late |
-| **2%** | **XGBoost + feature** | **95%** | **87%** | **0 steps** |
-| 2% | GNN + feature | 100% | 84% | 4 steps late |
-| 5% | XGBoost + feature | 61% | 99% | 6 steps early* |
-| 10%+ | either | 19-39% | ~100% | very early* |
+| Flag rate | Model | Precision | Real-world cost per 100 alerts | % of rings caught | Delay |
+|---|---|---|---|---|---|
+| 1% | XGBoost + feature | **100%** | 0 false alarms | 70% | 2 steps late |
+| 1% | GNN + feature | **100%** | 0 false alarms | 64% | 6 steps late |
+| **2%** | **XGBoost + feature** | **95%** | **5 legitimate customers held** | **87%** | **0 steps** |
+| 2% | GNN + feature | 100% | 0 false alarms | 84% | 4 steps late |
+| 5% | XGBoost + feature | 61% | 39 legitimate customers held | 99% | 6 steps early* |
+| 10%+ | either | 19-39% | **61-81 legitimate customers held** | ~100% | very early* |
 
-*Past ~5%, so many accounts get flagged that "catches early" is misleading
-— you're not detecting smarter, you're just casting a much wider net and
-accepting a lot more false alarms (at 10%+, roughly 2 out of 3 flagged
-accounts are innocent). That band is only usable for a human review queue,
-never for automated action.
+**This is the number that justifies locking Tier 1 to 2%, not looser:**
+crossing the 5% mark drops precision from 95% to 61% — and by 10%+, roughly
+2 out of every 3 alerts are false alarms. A gatekeeper that auto-blocks
+transactions cannot operate there; holding two innocent customers for every
+one real fraud ring is the kind of false-positive rate that erodes customer
+trust and generates support-ticket volume no automated system should create
+unsupervised. Past ~5%, "catches early" is also misleading in its own
+right — you're not detecting smarter, you're casting a much wider net.
+That band is only usable for a human review queue, never for unsupervised
+automated action.
 
 ## Production recommendation: a two-tier system
 
@@ -184,15 +202,28 @@ tuning until a convenient number appeared. Short version of the actual path:
 7. Swept the flagging threshold to turn "GNN is slower" from an impression
    into an exact, deployable number.
 
-## Explainability
+## Explainability — not a bonus feature, an AML compliance requirement
 
-For a flagged account, `src/explain/explain.py` (GNNExplainer) extracts the
-*specific* subgraph the model's decision was based on — not just "this
-account is suspicious" but "here are the other accounts and transfers
-implicated with it." Example: node 3209 (flagged with 100% confidence) has
-an explanatory subgraph of 49 other accounts, 6 of them independently
-labeled as fraud — exactly the kind of output a tabular model cannot
-produce, no matter how good its features are. See `results/explain_node_*.png`.
+In real anti-money-laundering operations, a model that outputs a bare risk
+score isn't sufficient on its own. Filing a Suspicious Activity Report
+(SAR), or freezing a customer's account, requires being able to show *why*
+— which accounts, which transfers, what pattern. Model risk management
+frameworks used across the financial industry (e.g. the Fed/OCC's SR 11-7
+guidance) specifically require that models influencing financial decisions
+be explainable and auditable, not just accurate. A black-box score that
+can't be justified to a regulator, auditor, or the customer whose account
+got frozen is a liability, not a deliverable — regardless of how good its
+PR-AUC is. (To be clear: this repo demonstrates the *kind* of capability
+that requirement demands, not a certified, audited compliance pipeline.)
+
+`src/explain/explain.py` (GNNExplainer) extracts the *specific* subgraph a
+flagged account's prediction was actually based on — not just "this account
+is suspicious" but "here are the other accounts and transfers implicated
+with it," which is exactly the artifact a SAR filing or investigator
+handoff needs. Example: node 3209 (flagged with 100% confidence) has an
+explanatory subgraph of 49 other accounts, 6 of them independently labeled
+as fraud — output a tabular model cannot produce, no matter how good its
+features are. See `results/explain_node_*.png`.
 
 ## Repo layout
 
