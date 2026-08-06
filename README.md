@@ -14,9 +14,9 @@ than models that only look at transaction volume?**
 |---|---|---|
 | Model | XGBoost + closed-loop feature | GraphSAGE GNN + closed-loop feature |
 | Operating point | 2% flag rate | 10-20% flag rate |
-| Detection lag | **0.0 steps** (flags as the ring forms) | 4-6 steps (doesn't need to be instant) |
-| Precision | 95% (few false alarms) | not the priority — a human reviews |
-| Recall | 87% of rings caught | 71-84% of rings mapped |
+| Detection lag | **0.0 steps** (flags as the ring forms) | not time-critical — runs after Tier 1 has already intervened |
+| Precision | 95% (5 false alarms per 100 alerts) | 20-39% (expected — a human reviews before any action is taken) |
+| Coverage | 87% of rings flagged within the monitoring window | 81-84% of fraud correctly identified per deep-scan pass |
 | Job | Block/hold the live transaction automatically | Map the *entire* ring for investigators, off the critical path |
 
 No single model does both jobs well — see [Results](#results) for why, and
@@ -65,6 +65,21 @@ when each one joined a ring — which makes it possible to measure detection
 | **Temporal GNN (TGN)** | An online model that updates its understanding of each account continuously as transactions arrive, instead of only seeing periodic snapshots. |
 | **XGBoost / GNN + closed-loop feature** | The baseline and GNN, each additionally given one explicit signal: a mathematical count of how many short closed loops of transfers pass through each account — a direct, computable stand-in for "is this account part of a ring." |
 
+### The core breakthrough
+
+Almost every result below traces back to one small addition: the closed-loop
+feature (computed directly from the transaction graph via sparse matrix
+algebra, no model training involved — see `src/data_pipeline/cycle_features.py`).
+It's the exact bridge that unlocked strong performance in *both* directions
+at once. XGBoost had no way to represent "this account sits on a loop of
+transfers" from volume/degree statistics alone — the feature handed it that
+signal directly, and detection speed went from 1-step-late to 0-step,
+instantly. The GNN, in principle, should already be able to discover ring
+structure through message passing — but giving it the same explicit,
+local ring-pattern evidence up front pushed its accuracy to the best of any
+model tested. Neither model reached its best result without this feature;
+it's doing more work than any single architecture choice in this project.
+
 ## Results
 
 ### Accuracy — how well each model tells fraud from normal accounts
@@ -100,6 +115,22 @@ given the same information, reacted to it immediately; the GNN — which
 aggregates information smoothed across many transactions and hops — got
 better at long-run accuracy but slower to react to a still-forming pattern.
 
+**Worth being precise about *why*, since two different models are involved
+here and it's easy to conflate them.** The 4-step lag belongs specifically
+to the *static* GNN+closed-loop-feature — it comes from structural
+aggregation inertia: multi-hop message passing waits for evidence to
+accumulate across a node's neighborhood before committing to a score, which
+is exactly what makes it *accurate*, not a defect. TGN was built to remove
+a different, separate problem — the static GNN's normalization being
+calibrated on the full graph and misapplied to sparse early snapshots — by
+scoring continuously instead of via snapshots. It succeeds at that
+specifically (no snapshot mismatch by construction), which is why its
+2-step lag is *not* inflated by the same mechanism. TGN's remaining lag more
+likely reflects its own attention-based neighbor aggregation plus a far
+smaller training budget (10 epochs vs. 300 for the static GNN) — a
+different, still-open question, not evidence the temporal architecture
+itself failed.
+
 ### The real tradeoff: precision vs. speed
 
 Flagging more accounts catches more fraud but also flags more innocent ones
@@ -110,25 +141,31 @@ transaction gets held or step-up-authenticated for no reason — that's the
 number that decides whether a threshold is deployable for *automated*
 action, or only safe for a human review queue.
 
-| Flag rate | Model | Precision | Real-world cost per 100 alerts | % of rings caught | Delay |
-|---|---|---|---|---|---|
-| 1% | XGBoost + feature | **100%** | 0 false alarms | 70% | 2 steps late |
-| 1% | GNN + feature | **100%** | 0 false alarms | 64% | 6 steps late |
-| **2%** | **XGBoost + feature** | **95%** | **5 legitimate customers held** | **87%** | **0 steps** |
-| 2% | GNN + feature | 100% | 0 false alarms | 84% | 4 steps late |
-| 5% | XGBoost + feature | 61% | 39 legitimate customers held | 99% | 6 steps early* |
-| 10%+ | either | 19-39% | **61-81 legitimate customers held** | ~100% | very early* |
+| Flag rate | Model | Precision | Real-world cost per 100 alerts | % of rings caught | Delay | Recommended deployment role |
+|---|---|---|---|---|---|---|
+| 1% | XGBoost + feature | **100%** | 0 false alarms | 70% | 2 steps late | Extreme-security auto-block (zero false-positive tolerance) |
+| 1% | GNN + feature | **100%** | 0 false alarms | 64% | 6 steps late | Dominated by XGBoost @ 1% — same precision, better coverage |
+| **2%** | **XGBoost + feature** | **95%** | **5 legitimate customers held** | **87%** | **0 steps** | **Standard Tier-1 auto-gatekeeper (recommended)** |
+| 2% | GNN + feature | 100% | 0 false alarms | 84% | 4 steps late | Higher precision, but too slow to block live money |
+| 5% | XGBoost + feature | 61% | 39 legitimate customers held | 99% | 6 steps early* | Too many false alarms to automate — review queue only |
+| 10-20% | GNN + feature | 20-39% | 61-80 legitimate customers held | 81-84% recall* | not time-critical | **Tier-2 async review queue (recommended)** |
 
 **This is the number that justifies locking Tier 1 to 2%, not looser:**
-crossing the 5% mark drops precision from 95% to 61% — and by 10%+, roughly
-2 out of every 3 alerts are false alarms. A gatekeeper that auto-blocks
-transactions cannot operate there; holding two innocent customers for every
-one real fraud ring is the kind of false-positive rate that erodes customer
-trust and generates support-ticket volume no automated system should create
-unsupervised. Past ~5%, "catches early" is also misleading in its own
-right — you're not detecting smarter, you're casting a much wider net.
-That band is only usable for a human review queue, never for unsupervised
-automated action.
+crossing the 5% mark drops precision from 95% to 61% — and by 10-20%, 61-80
+out of every 100 alerts are false alarms. A gatekeeper that auto-blocks
+transactions cannot operate there; a false-positive rate like that erodes
+customer trust and generates support-ticket volume no automated system
+should create unsupervised. That band is exactly where Tier 2 belongs
+instead — a human reviews before anything happens, so low precision is an
+acceptable cost for higher coverage.
+
+*Past ~5%, the cumulative "% of rings caught" metric used elsewhere in this
+table starts saturating near 100% regardless of real signal — an artifact of
+flagging so many accounts that nearly everything eventually gets swept in
+across the monitoring window, not smarter detection (that's also why the
+5% row's "6 steps early" looks better than it should be trusted at face
+value). By 10-20% this saturation is total, so that row reports single-pass
+recall (81-84%) instead — the more honest number for that band.
 
 ## Production recommendation: a two-tier system
 
@@ -159,8 +196,8 @@ automated blocking.
 
 **Tier 2 — background deep scan: GraphSAGE GNN + closed-loop feature, run
 asynchronously.** Doesn't need to block anything in real time, so it can run
-looser (10-20% flag rate, 71-84% of rings found) and use its superior
-accuracy to map out the *entire* ring — other shell accounts, other
+looser (10-20% flag rate, 81-84% recall per deep-scan pass) and use its
+superior accuracy to map out the *entire* ring — other shell accounts, other
 connected transfers — once Tier 1 has already paused the live transaction.
 
 Neither model alone is the right answer. The fast one misses ~13% of rings
